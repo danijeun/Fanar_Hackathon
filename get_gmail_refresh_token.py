@@ -1,5 +1,9 @@
 import os
 from google_auth_oauthlib.flow import InstalledAppFlow
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 CLIENT_ID = os.getenv("GMAIL_CLIENT_ID")
 CLIENT_SECRET = os.getenv("GMAIL_CLIENT_SECRET")

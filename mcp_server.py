@@ -5,11 +5,16 @@ import os
 import requests
 from dotenv import load_dotenv
 from openai import OpenAI
+from datetime import datetime
+import pytz
+from tzlocal import get_localzone
 
 # Gmail/Calendar OAuth2 imports
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
 import base64
 from serpapi import GoogleSearch
 
@@ -19,10 +24,32 @@ GMAIL_CLIENT_ID = os.getenv("GMAIL_CLIENT_ID")
 GMAIL_CLIENT_SECRET = os.getenv("GMAIL_CLIENT_SECRET")
 GMAIL_REDIRECT_URI = os.getenv("GMAIL_REDIRECT_URI")
 GMAIL_REFRESH_TOKEN = os.getenv("GMAIL_REFRESH_TOKEN")
-CALENDAR_ID = "danijeun@gmail.com"
+CALENDAR_ID = "hackathonfanar@gmail.com"
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 
 app = FastAPI(title="MCP REST Server (FastAPI)")
+
+# --- Google API Utility ---
+def _get_google_service(api_name: str, api_version: str, scopes: list[str]):
+    """Helper function to create a Google API service client."""
+    if not GMAIL_REFRESH_TOKEN:
+        raise HTTPException(status_code=500, detail="GMAIL_REFRESH_TOKEN not set in environment.")
+    
+    try:
+        creds = Credentials(
+            None,
+            refresh_token=GMAIL_REFRESH_TOKEN,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=GMAIL_CLIENT_ID,
+            client_secret=GMAIL_CLIENT_SECRET,
+            scopes=scopes,
+        )
+        service = build(api_name, api_version, credentials=creds)
+        return service
+    except Exception as e:
+        # This could be due to invalid credentials, expired refresh token, etc.
+        print(f"[ERROR] Failed to create Google service '{api_name} v{api_version}': {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to authenticate with Google: {e}")
 
 # Initialize Fanar OpenAI Client
 fanar_client = OpenAI(
@@ -38,32 +65,50 @@ class TranslatePayload(BaseModel):
 class GmailPayload(BaseModel):
     subject: str
     body: str
+    recipient: str
+    image_b64: Optional[str] = None
 
-class CalendarCreatePayload(BaseModel):
+class CreateCalendarEventPayload(BaseModel):
     summary: str
-    start: str  # ISO format string
-    end: str    # ISO format string
-    description: Optional[str] = ""
-    location: Optional[str] = ""
+    start: str
+    end: str
+    description: Optional[str] = None
+    location: Optional[str] = None
 
-class CalendarSearchPayload(BaseModel):
-    query: Optional[str] = ""
-    max_results: Optional[int] = 5
+class ListCalendarEventsPayload(BaseModel):
+    query: Optional[str] = None
+    max_results: int = 10
     time_min: Optional[str] = None
     time_max: Optional[str] = None
 
-class CalendarUpdatePayload(BaseModel):
-    event_id: str
-    updates: Dict[str, Any]
-
-class CalendarDeletePayload(BaseModel):
-    event_id: str
+class FormatEmailPayload(BaseModel):
+    body: str
+    recipient_name: Optional[str] = None
 
 class ImageGeneratePayload(BaseModel):
     prompt: str
 
 class WebSearchPayload(BaseModel):
     query: str
+
+class GenerateImageAndSendEmailPayload(BaseModel):
+    prompt: str
+    recipient: str
+    subject: str
+    body: str
+
+def to_utc_iso(local_dt_str: str, local_fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Converts a local datetime string to a UTC ISO formatted string for Google Calendar."""
+    try:
+        local_dt = datetime.strptime(local_dt_str, local_fmt)
+        local_tz = get_localzone()
+        local_aware = local_tz.localize(local_dt) if hasattr(local_tz, 'localize') else local_dt.replace(tzinfo=local_tz)
+        utc_dt = local_aware.astimezone(pytz.UTC)
+        return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, TypeError) as e:
+        print(f"[ERROR] Could not parse date string '{local_dt_str}'. Error: {e}")
+        # Re-raise as HTTPException so the client gets a clean error
+        raise HTTPException(status_code=400, detail=f"Invalid date format for '{local_dt_str}'. Please use 'YYYY-MM-DD HH:MM'.")
 
 @app.post("/mcp/translate_text")
 def mcp_translate_text(payload: TranslatePayload):
@@ -92,26 +137,31 @@ def mcp_translate_text(payload: TranslatePayload):
 
 @app.post("/mcp/send_gmail")
 def mcp_send_gmail(payload: GmailPayload):
-    to_email = "danijeun@gmail.com"  # Only allow this recipient
+    to_email = payload.recipient
 
     if not all([GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REDIRECT_URI, GMAIL_REFRESH_TOKEN]):
         raise HTTPException(status_code=500, detail="Gmail OAuth credentials not set in environment.")
 
     try:
-        creds = Credentials(
-            None,
-            refresh_token=GMAIL_REFRESH_TOKEN,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=GMAIL_CLIENT_ID,
-            client_secret=GMAIL_CLIENT_SECRET,
-            scopes=["https://www.googleapis.com/auth/gmail.send"],
-        )
-        service = build("gmail", "v1", credentials=creds)
-        message = MIMEText(payload.body)
+        service = _get_google_service("gmail", "v1", ["https://www.googleapis.com/auth/gmail.send"])
+        
+        if payload.image_b64:
+            message = MIMEMultipart()
+            msg_text = MIMEText(payload.body)
+            message.attach(msg_text)
+            
+            # Decode the base64 string
+            image_data = base64.b64decode(payload.image_b64)
+            image = MIMEImage(image_data, name="image.png")
+            message.attach(image)
+        else:
+            message = MIMEText(payload.body)
+
         message["to"] = to_email
         message["from"] = "me"
         message["subject"] = payload.subject
         raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        
         send_result = service.users().messages().send(
             userId="me",
             body={"raw": raw_message}
@@ -120,23 +170,24 @@ def mcp_send_gmail(payload: GmailPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
 
-@app.post("/mcp/calendar_create_event")
-def mcp_calendar_create_event(payload: CalendarCreatePayload):
-    creds = Credentials(
-        None,
-        refresh_token=GMAIL_REFRESH_TOKEN,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GMAIL_CLIENT_ID,
-        client_secret=GMAIL_CLIENT_SECRET,
-        scopes=["https://www.googleapis.com/auth/calendar"]
-    )
-    service = build("calendar", "v3", credentials=creds)
+@app.post("/mcp/create_calendar_event")
+def mcp_create_calendar_event(payload: CreateCalendarEventPayload):
+    service = _get_google_service("calendar", "v3", ["https://www.googleapis.com/auth/calendar"])
+
+    # Convert start and end times to the required format
+    try:
+        start_utc = to_utc_iso(payload.start)
+        end_utc = to_utc_iso(payload.end)
+    except HTTPException as e:
+        # Forward the specific date parsing error to the client
+        raise e
+
     event = {
         "summary": payload.summary,
         "location": payload.location,
         "description": payload.description,
-        "start": {"dateTime": payload.start, "timeZone": "UTC"},
-        "end": {"dateTime": payload.end, "timeZone": "UTC"},
+        "start": {"dateTime": start_utc, "timeZone": "UTC"},
+        "end": {"dateTime": end_utc, "timeZone": "UTC"},
     }
     try:
         created_event = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
@@ -144,17 +195,9 @@ def mcp_calendar_create_event(payload: CalendarCreatePayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create event: {str(e)}")
 
-@app.post("/mcp/calendar_search_event")
-def mcp_calendar_search_event(payload: CalendarSearchPayload):
-    creds = Credentials(
-        None,
-        refresh_token=GMAIL_REFRESH_TOKEN,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GMAIL_CLIENT_ID,
-        client_secret=GMAIL_CLIENT_SECRET,
-        scopes=["https://www.googleapis.com/auth/calendar"]
-    )
-    service = build("calendar", "v3", credentials=creds)
+@app.post("/mcp/list_calendar_events")
+def mcp_list_calendar_events(payload: ListCalendarEventsPayload):
+    service = _get_google_service("calendar", "v3", ["https://www.googleapis.com/auth/calendar"])
     try:
         list_params = {
             "calendarId": CALENDAR_ID,
@@ -175,41 +218,24 @@ def mcp_calendar_search_event(payload: CalendarSearchPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to search events: {str(e)}")
 
-@app.post("/mcp/calendar_update_event")
-def mcp_calendar_update_event(payload: CalendarUpdatePayload):
-    creds = Credentials(
-        None,
-        refresh_token=GMAIL_REFRESH_TOKEN,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GMAIL_CLIENT_ID,
-        client_secret=GMAIL_CLIENT_SECRET,
-        scopes=["https://www.googleapis.com/auth/calendar"]
-    )
-    service = build("calendar", "v3", credentials=creds)
-    try:
-        event = service.events().get(calendarId=CALENDAR_ID, eventId=payload.event_id).execute()
-        event.update(payload.updates)
-        updated_event = service.events().update(calendarId=CALENDAR_ID, eventId=payload.event_id, body=event).execute()
-        return {"result": "Event updated", "event": updated_event}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update event: {str(e)}")
+@app.post("/mcp/format_professional_arabic_email")
+def mcp_format_email(payload: FormatEmailPayload):
+    """Wraps text in a professional Arabic email format."""
+    salutation = "عزيزي"
+    if payload.recipient_name:
+        salutation = f"عزيزي {payload.recipient_name},"
 
-@app.post("/mcp/calendar_delete_event")
-def mcp_calendar_delete_event(payload: CalendarDeletePayload):
-    creds = Credentials(
-        None,
-        refresh_token=GMAIL_REFRESH_TOKEN,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GMAIL_CLIENT_ID,
-        client_secret=GMAIL_CLIENT_SECRET,
-        scopes=["https://www.googleapis.com/auth/calendar"]
-    )
-    service = build("calendar", "v3", credentials=creds)
-    try:
-        service.events().delete(calendarId=CALENDAR_ID, eventId=payload.event_id).execute()
-        return {"result": f"Event {payload.event_id} deleted."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete event: {str(e)}")
+    closing = "مع خالص التقدير،"
+    
+    formatted_body = f"""
+{salutation}
+
+{payload.body}
+
+{closing}
+فريق فنار
+"""
+    return {"result": "Email body formatted.", "formatted_body": formatted_body.strip()}
 
 @app.post("/mcp/generate_image")
 def mcp_generate_image(payload: ImageGeneratePayload):
@@ -262,6 +288,65 @@ def mcp_web_search(payload: WebSearchPayload):
     except Exception as e:
         print(f"Error in web search: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to perform web search: {str(e)}")
+
+@app.post("/mcp/generate_image_and_send_email")
+def mcp_generate_image_and_send_email(payload: GenerateImageAndSendEmailPayload):
+    """Generates an image and sends it in an email."""
+    try:
+        # Step 1: Generate the image by calling the other endpoint's function
+        image_payload = ImageGeneratePayload(prompt=payload.prompt)
+        image_response = mcp_generate_image(image_payload)
+        
+        image_b64 = image_response.get("image_b64")
+        if not image_b64:
+            raise HTTPException(status_code=500, detail="Image generation failed, no image data returned.")
+
+        # Step 2: Send the email with the image
+        email_payload = GmailPayload(
+            recipient=payload.recipient,
+            subject=payload.subject,
+            body=payload.body,
+            image_b64=image_b64
+        )
+        email_response = mcp_send_gmail(email_payload)
+        return email_response
+
+    except HTTPException as e:
+        # Re-raise HTTPException to propagate the error response
+        raise e
+    except Exception as e:
+        logger.error(f"Error in generate_image_and_send_email: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+def generate_image_and_send_email(prompt: str, recipient: str, subject: str, body: str):
+    """Generates an image and sends it in an email."""
+    try:
+        # Step 1: Generate the image
+        image_response = mcp_generate_image(ImageGeneratePayload(prompt=prompt))
+        if "error" in image_response:
+            return image_response  # Propagate the error
+        
+        image_b64 = image_response.get("image_b64")
+        if not image_b64:
+            return {"error": "Image generation failed, no image data returned."}
+
+        # Step 2: Send the email with the image
+        email_response = mcp_send_gmail(GmailPayload(
+            subject=subject,
+            body=body,
+            recipient=recipient,
+            image_b64=image_b64
+        ))
+        return email_response
+
+    except Exception as e:
+        logger.error(f"Error in generate_image_and_send_email: {e}")
+        return {"error": str(e)}
+
+def translate_text(text: str, target_lang: str):
+    """Translates text to a target language."""
+    # ... existing code ...
+    return {"result": "Translation completed", "translated_text": translated_text}
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,20 +1,21 @@
-streamlit 
-openai
-mem0ai
-multion
-transformers
-torch
-supabase
-python-dotenv
-tzlocal
-pytz
-google-api-python-client
+# Core Server
 fastapi
 uvicorn
-requests
-python-telegram-bot
-nest-asyncio
-pydub
+gunicorn
+
+# AI & API Clients
+openai
+python-telegram-bot[httpx]
+google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
-google-search-results
+serpapi
+requests
+
+# Utilities
+python-dotenv
+pytz
+tzlocal
+pydantic
+nest-asyncio
+pydub

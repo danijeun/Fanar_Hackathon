@@ -7,6 +7,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 from backend.app import get_agent_response, get_vision_response, generate_image_from_prompt
+from backend.database import init_db, get_conversation_history, update_conversation_history, clear_conversation_history
 import nest_asyncio
 from openai import OpenAI
 from pydub import AudioSegment
@@ -19,15 +20,20 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 FANAR_API_KEY = os.getenv("FANAR_API_KEY")
 
-# Enable logging
+# --- Logging Setup ---
+# Set the logging level for all loggers to WARNING to suppress INFO and DEBUG messages
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.WARNING
 )
+# Keep httpx logging at WARNING as it's particularly verbose
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger(__name__)
 
-# Dictionary to store conversation history per user
-conversation_histories = {}
+# Get the root logger and set its level to WARNING.
+# This is a more forceful way to ensure no DEBUG/INFO logs from libraries get through.
+logging.getLogger().setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
 
 # --- Fanar TTS ---
 def get_tts_audio(text):
@@ -70,21 +76,25 @@ def transcribe_audio(audio_bytes):
 
 # --- Bot Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message when the /start command is issued."""
+    """Sends a welcome message and asks the user to log in."""
     user = update.effective_user
     chat_id = update.message.chat_id
-    conversation_histories[chat_id] = [] # Reset history on start
+    clear_conversation_history(chat_id)  # Reset history on start
+
     await update.message.reply_html(
-        rf"Hi {user.mention_html()}! I'm your AI assistant. How can I help you today?",
+        rf"Hi {user.mention_html()}! I'm your professional AI email assistant, powered by Fanar. "
+        "I can help you compose, format, and send emails to anyone from hackathonfanar@gmail.com. "
+        "To get started, just tell me what email you'd like to send."
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles incoming text messages and gets a response from the agent."""
+    """Handles all incoming text and photo messages."""
+    user_id = update.message.from_user.id
     chat_id = update.message.chat_id
     user_input = update.message.text
     
-    # Get user's conversation history, or create a new one
-    history = conversation_histories.get(chat_id, [])
+    # Get user's conversation history from the database
+    history = get_conversation_history(chat_id)
     
     # Send a "typing..." notification
     await context.bot.send_chat_action(chat_id=chat_id, action='typing')
@@ -96,8 +106,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         None, get_agent_response, user_input, history
     )
 
-    # Update the user's history
-    conversation_histories[chat_id] = updated_history
+    # Update the user's history in the database
+    update_conversation_history(chat_id, updated_history)
     
     # Send the response back to the user
     if media_response:
@@ -132,12 +142,12 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text(f"Heard: \"{transcribed_text}\"")
             
             # Now, process this text with the agent like a normal message
-            history = conversation_histories.get(chat_id, [])
+            history = get_conversation_history(chat_id)
             loop = asyncio.get_event_loop()
             text_response, media_response, updated_history = await loop.run_in_executor(
                 None, get_agent_response, transcribed_text, history
             )
-            conversation_histories[chat_id] = updated_history
+            update_conversation_history(chat_id, updated_history)
             
             # Handle the response (could be text or an image)
             if media_response:
@@ -220,6 +230,9 @@ def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not set in environment. Please add it to your .env file.")
         return
+
+    # Initialize the database
+    init_db()
 
     # Increase the timeout for the Telegram bot's HTTP requests.
     # Default is 5s, but image generation and upload can take longer.
