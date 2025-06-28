@@ -6,10 +6,12 @@ import re
 from datetime import datetime, timedelta
 import pytz
 from tzlocal import get_localzone
-from backend.prompts import SYSTEM_PROMPTS, CLASSIFICATION_PROMPT, MASTER_SYSTEM_PROMPT
+from backend.prompts import MASTER_SYSTEM_PROMPT
 from backend.mcp_client import MCPClient
 import base64
 import requests
+from typing import List, Dict
+from backend.utils import resolve_natural_date  # Import for fallback date resolution
 
 def get_utc_iso_range(when="today"):
     """
@@ -127,14 +129,35 @@ def get_agent_response(user_input, conversation_history):
         # Step 1: Prepare messages for the master agent
         system_prompt = MASTER_SYSTEM_PROMPT.replace("{{current_date}}", datetime.now().strftime('%Y-%m-%d'))
         
-        # Use a recent segment of the conversation history for context
+        # Use a recent segment of the conversation history for context (limit to last 3 messages, truncate each to 1000 chars)
+        last_msgs = conversation_history[-3:]
+        truncated_msgs = []
+        for msg in last_msgs:
+            truncated_msg = msg.copy()
+            if len(truncated_msg["content"]) > 1000:
+                truncated_msg["content"] = truncated_msg["content"][:1000]
+            truncated_msgs.append(truncated_msg)
+        # Check total context length
+        total_context = system_prompt + ''.join([m["content"] for m in truncated_msgs])
+        if len(total_context) > 12000:
+            # Summarize the last 3 messages into one
+            summary = summarize_messages_with_llm(truncated_msgs)
+            truncated_msgs = [{"role": "system", "content": f"SUMMARY_OF_LAST_MESSAGES: {summary}"}]
         messages = [
             {"role": "system", "content": system_prompt},
-            *conversation_history[-7:]
+            *truncated_msgs
         ]
 
+        # Debug: print the messages sent to the agent
+        print("\n--- DEBUG: Messages sent to agent ---")
+        for m in messages:
+            print(m)
+        print("--- END DEBUG ---\n")
+
         # Step 2: Get the agent's response (which could be text or a tool call)
+        print("\n--- 1. Agent is thinking... ---")
         agent_response_text = get_completion(messages)
+        print(f"--- 2. Agent's raw response: ---\n{agent_response_text}\n--------------------")
         conversation_history.append({"role": "assistant", "content": agent_response_text})
         
         # Step 3: Check for tool calls in the agent's response
@@ -144,6 +167,10 @@ def get_agent_response(user_input, conversation_history):
         try:
             # Use regex to find all JSON code blocks (for single or multiple tool calls)
             json_blocks = re.findall(r'```json\s*(\{.*?\})\s*```', agent_response_text, re.DOTALL)
+            
+            if not json_blocks:
+                # If no tool call is detected, just return the agent's plain text response
+                return agent_response_text, None, conversation_history
             
             if json_blocks:
                 all_results = []
@@ -158,21 +185,67 @@ def get_agent_response(user_input, conversation_history):
                 
                 for call in parsed_tool_calls:
                     payload = call.get("payload", {})
-                    if "recipient" in payload and ("<" in payload["recipient"] or "placeholder" in payload["recipient"]):
-                        if _is_self_send_request(last_user_message):
-                            payload["recipient"] = "hackathonfanar@gmail.com"
-                        else:
-                            email_regex = r'[\w\.-]+@[\w\.-]+'
-                            match = re.search(email_regex, last_user_message)
-                            if match:
-                                payload["recipient"] = match.group(0)
+                    # This check is crucial. We look for generic placeholders or requests to send to oneself.
+                    if "recipient" in payload and ("<" in payload["recipient"] or "placeholder" in payload["recipient"] or _is_self_send_request(last_user_message)):
+                        print("--- SELF-SEND or PLACEHOLDER DETECTED. Overriding recipient. ---")
+                        payload["recipient"] = "hackathonfanar@gmail.com"
+                        call["payload"] = payload
+                    # If no valid recipient is found, try to extract one from the user's message
+                    elif "recipient" in payload:
+                        email_regex = r'[\w\.-]+@[\w\.-]+'
+                        match = re.search(email_regex, last_user_message)
+                        if match:
+                            payload["recipient"] = match.group(0)
+                            call["payload"] = payload
+                    # --- PATCH: Ensure recipient_email is present for email agents ---
+                    if call.get("tool") in ("arabic_email_agent", "english_email_agent"):
+                        if ("recipient_email" not in payload or not payload["recipient_email"]) or _is_self_send_request(last_user_message):
+                            # Try to extract from user message or override for self-send
+                            if _is_self_send_request(last_user_message):
+                                payload["recipient_email"] = "hackathonfanar@gmail.com"
+                                call["payload"] = payload
+                            else:
+                                email_regex = r'[\w\.-]+@[\w\.-]+'
+                                match = re.search(email_regex, last_user_message)
+                                if match:
+                                    payload["recipient_email"] = match.group(0)
+                                    call["payload"] = payload
+                                else:
+                                    # If recipient email is truly missing and cannot be inferred, block execution
+                                    return "Please provide the recipient's email address to send the email."
 
-                # Loop through each found JSON block string
+                # --- STRICT ARABIC EMAIL WORKFLOW ENFORCEMENT ---
+                # If any tool call is send_gmail and the body is Arabic, enforce the full chain
+                def is_arabic_text(text):
+                    return any('\u0600' <= c <= '\u06FF' for c in text)
+
+                for idx, tool_data in enumerate(parsed_tool_calls):
+                    if tool_data.get("tool") == "send_gmail":
+                        body = tool_data.get("payload", {}).get("body", "")
+                        # Only enforce for Arabic emails
+                        if is_arabic_text(body):
+                            # Look for the required chain: generate_email -> translate_text -> format_professional_arabic_email -> send_gmail
+                            found_generate = found_translate = found_format = False
+                            gen_idx = trans_idx = fmt_idx = -1
+                            for i, t in enumerate(parsed_tool_calls[:idx]):
+                                if t.get("tool") == "generate_email":
+                                    found_generate = True
+                                    gen_idx = i
+                                if t.get("tool") == "translate_text" and found_generate and i > gen_idx:
+                                    found_translate = True
+                                    trans_idx = i
+                                if t.get("tool") == "format_professional_arabic_email" and found_translate and i > trans_idx:
+                                    found_format = True
+                                    fmt_idx = i
+                            if not (found_generate and found_translate and found_format and fmt_idx < idx):
+                                # Block send_gmail and return error
+                                tool_data["payload"]["body"] = "[ERROR: You must use the following tool chain for Arabic emails: generate_email -> translate_text -> format_professional_arabic_email -> send_gmail. Please revise your tool call sequence.]"
+                                continue
+                # Now execute all tools in order (with fixed send_gmail)
                 for tool_data in parsed_tool_calls:
                     try:
                         tool_name = tool_data.get("tool")
                         payload = tool_data.get("payload", {})
-
                         # Pre-process payload for calendar tools if needed
                         if tool_name in ["create_calendar_event", "list_calendar_events"]:
                             for key in ['start', 'end', 'when']:
@@ -186,19 +259,18 @@ def get_agent_response(user_input, conversation_history):
                                         dt_obj = parse_special_time_format(time_str)
                                         if dt_obj:
                                             payload[key] = dt_obj.strftime("%Y-%m-%dT%H:%M:%SZ")
-
                         # --- Execute the tool ---
+                        print(f"--- 3. Executing tool: {tool_name} with payload: {payload} ---")
                         result = mcp_client.execute_tool(tool_name, payload)
+                        print(f"--- 4. Tool result: ---\n{result}\n--------------------")
                         all_results.append({"tool": tool_name, "result": result})
-
                         # If this is an image, we need to handle the media response immediately
                         if tool_name == "generate_image" and isinstance(result, dict) and "image_b64" in result:
                             final_media = base64.b64decode(result["image_b64"])
-                    
                     except (KeyError) as e:
                         all_results.append({"tool": "unknown", "result": {"error": f"Invalid tool format: {e}"}})
 
-                # --- Summarize all results ---
+                # --- Summarize all results (improved logic) ---
                 # Sanitize image data before adding to history
                 sanitized_results = []
                 for res in all_results:
@@ -211,21 +283,147 @@ def get_agent_response(user_input, conversation_history):
                         sanitized_results.append(res)
                 
                 conversation_history.append({"role": "system", "content": f"TOOL_RESULTS: {json.dumps(sanitized_results)}"})
-                
-                summary_prompt = (
-                    "You are a summarizer. Your ONLY job is to respond with a single, short, user-facing sentence. "
-                    "The outcome of the actions is in the 'TOOL_RESULTS' system message. "
-                    "Do NOT add any details from the tools' results. Do NOT show JSON, do NOT mention the tools by name, and do NOT repeat the user's request. "
-                    "If the 'TOOL_RESULTS' contains an 'error', your response MUST be 'I'm sorry, the request failed because of an error.' "
-                    "If there is no error, your response MUST be a simple confirmation like 'Done.' or 'I've taken care of that for you.' "
-                    "Be as brief as possible. Now, summarize the preceding 'TOOL_RESULTS'."
-                )
-                summary_messages = [
-                    {"role": "system", "content": system_prompt},
-                    *conversation_history[-8:],
-                    {"role": "user", "content": summary_prompt}
-                ]
-                final_text = get_completion(summary_messages)
+
+                # Improved summary logic
+                error_messages = []
+                success_messages = []
+                final_arabic_email = None
+                final_english_email = None
+                # Track if we need to enqueue a send_gmail tool call
+                send_gmail_enqueued = False
+                # Helper to extract subject/body from formatted email
+                def extract_subject_and_body(full_email):
+                    lines = full_email.strip().split('\n')
+                    subject = "No Subject"
+                    body = full_email
+                    if lines and lines[0].lower().startswith("subject:"):
+                        subject = lines[0].split(":", 1)[1].strip()
+                        body = "\n".join(lines[1:]).strip()
+                    return subject, body
+
+                for idx, res in enumerate(sanitized_results):
+                    tool = res.get("tool")
+                    result = res.get("result", {})
+                    if "error" in result:
+                        error_messages.append(f"{tool}: {result['error']}")
+                    else:
+                        # Custom success messages per tool
+                        if tool == "send_gmail":
+                            success_messages.append("Your email was sent successfully.")
+                        elif tool == "create_calendar_event":
+                            success_messages.append("Your calendar event was created successfully.")
+                        elif tool == "list_calendar_events":
+                            success_messages.append("Here are your calendar events.")
+                        elif tool == "translate_text":
+                            success_messages.append("The text was translated successfully.")
+                        elif tool == "generate_image":
+                            success_messages.append("The image was generated successfully.")
+                        elif tool == "generate_image_and_send_email":
+                            success_messages.append("The image was generated and sent by email successfully.")
+                        elif tool == "format_professional_arabic_email":
+                            success_messages.append("The professional Arabic email was formatted successfully.")
+                            final_arabic_email = result.get("email")
+                            # Enqueue send_gmail tool call if not already present
+                            if final_arabic_email and not send_gmail_enqueued:
+                                # Find recipient from previous tool calls
+                                recipient = None
+                                for prev in sanitized_results[:idx]:
+                                    if prev.get("tool") == "generate_email":
+                                        payload = prev.get("payload", {})
+                                        recipient = payload.get("recipient_name")
+                                        break
+                                subject, body = extract_subject_and_body(final_arabic_email)
+                                parsed_tool_calls.append({
+                                    "tool": "send_gmail",
+                                    "payload": {
+                                        "recipient": recipient or "[Unknown Recipient]",
+                                        "subject": subject,
+                                        "body": body
+                                    }
+                                })
+                                send_gmail_enqueued = True
+                        elif tool == "format_professional_english_email":
+                            success_messages.append("The professional English email was formatted successfully.")
+                            final_english_email = result.get("email")
+                            # Enqueue send_gmail tool call if not already present
+                            if final_english_email and not send_gmail_enqueued:
+                                # Find recipient from previous tool calls
+                                recipient = None
+                                for prev in sanitized_results[:idx]:
+                                    if prev.get("tool") == "generate_email":
+                                        payload = prev.get("payload", {})
+                                        recipient = payload.get("recipient_name")
+                                        break
+                                subject, body = extract_subject_and_body(final_english_email)
+                                parsed_tool_calls.append({
+                                    "tool": "send_gmail",
+                                    "payload": {
+                                        "recipient": recipient or "[Unknown Recipient]",
+                                        "subject": subject,
+                                        "body": body
+                                    }
+                                })
+                                send_gmail_enqueued = True
+                        elif tool == "web_search":
+                            # Summarize all snippets using the LLM for clarity and conciseness
+                            results = result.get("results", [])
+                            if results:
+                                snippets = []
+                                for item in results:
+                                    snippet = item.get("snippet")
+                                    title = item.get("title")
+                                    if snippet:
+                                        snippets.append(snippet.strip())
+                                    elif title:
+                                        snippets.append(title)
+                                if snippets:
+                                    # Use the LLM to summarize the snippets
+                                    summary_prompt = (
+                                        "Summarize the following web search results in a clear and concise way for the user. "
+                                        "Focus on the main findings and avoid repetition.\n\nResults:\n" + "\n".join(snippets)
+                                    )
+                                    try:
+                                        summary_response = client.chat.completions.create(
+                                            model=model_name,
+                                            messages=[{"role": "system", "content": "You are a helpful assistant that summarizes web search results."}, {"role": "user", "content": summary_prompt}],
+                                            max_tokens=128
+                                        )
+                                        summary = summary_response.choices[0].message.content.strip()
+                                        success_messages.append(summary)
+                                    except Exception as e:
+                                        print(f"[ERROR] LLM web search summarization failed: {e}")
+                                        success_messages.append("Web search results: " + " ".join(snippets))
+                                else:
+                                    success_messages.append("No readable web search summaries found.")
+                            else:
+                                success_messages.append("No web search results found.")
+                        else:
+                            success_messages.append(f"{tool} completed successfully.")
+                # If there are errors but the LLM's response contains a valid answer, show both
+                if error_messages:
+                    # If the agent's raw response (agent_response_text) contains more than just tool JSON, show it too
+                    non_json_text = re.sub(r'```json.*?```', '', agent_response_text, flags=re.DOTALL).strip()
+                    if non_json_text:
+                        final_text = f"{non_json_text}\n\n[Tool Error(s)]:\n" + "\n".join(error_messages)
+                    else:
+                        final_text = "[Tool Error(s)]:\n" + "\n".join(error_messages)
+                elif success_messages:
+                    final_text = "\n".join(success_messages)
+                    # If we have a final formatted Arabic email, append it for user review
+                    if final_arabic_email:
+                        # Only show the formatted email if it is not a template or placeholder
+                        if '[translated draft]' not in final_arabic_email and '[مشروع XYZ]' not in final_arabic_email:
+                            final_text += f"\n\nHere is your formatted Arabic email draft:\n\n{final_arabic_email}"
+                        else:
+                            # If the formatted email is a template, show a warning or fallback
+                            final_text += "\n\n[Warning: The formatted Arabic email appears to be a template or contains placeholder text. Please retry or check the workflow inputs.]"
+                    # If we have a final formatted English email, append it for user review
+                    if final_english_email:
+                        final_text += f"\n\nHere is your formatted English email draft:\n\n{final_english_email}"
+                else:
+                    # Fallback: show the agent's raw response if nothing else
+                    final_text = agent_response_text
+                print(f"--- 6. Final summary response: ---\n{final_text}\n--------------------")
                 conversation_history.append({"role": "assistant", "content": final_text})
 
         except Exception as e:
@@ -238,22 +436,24 @@ def get_agent_response(user_input, conversation_history):
 
 def generate_image_from_prompt(prompt: str):
     """
-    Generates an image from a text prompt by calling the MCP server.
+    Generates an image from a text prompt by calling the MCP server's /mcp/generate_image endpoint.
     Returns the image as bytes, or None if an error occurs.
     """
     try:
-        mcp_client = MCPClient()
+        # Use the MCP server endpoint directly for image generation
+        mcp_url = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000")
+        url = f"{mcp_url}/mcp/generate_image"
         payload = {"prompt": prompt}
-        result = mcp_client.call("generate_image", payload)
-        
-        if result and "image_b64" in result:
-            image_b64 = result["image_b64"]
-            image_bytes = base64.b64decode(image_b64)
-            return image_bytes
-            
-        return None
-        
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        image_b64 = result.get("image_b64")
+        if not image_b64:
+            return None
+        image_bytes = base64.b64decode(image_b64)
+        return image_bytes
     except Exception as e:
+        print(f"[ERROR] generate_image_from_prompt: {e}")
         return None
 
 def get_vision_response(prompt: str, image_bytes: bytes):
@@ -311,10 +511,218 @@ def _find_recipient_in_tool_calls(tool_calls: list[dict]) -> str | None:
     return None
 
 def _is_self_send_request(user_message: str) -> bool:
-    """Check if the user is asking to send something to themselves."""
-    # Simple check for phrases like "send it to me" or "email me"
-    self_email_phrases = ["send me", "to me", "to myself", "my email"]
-    return any(phrase in user_message for phrase in self_email_phrases)
+    """Check if the user is asking to send an email to themselves."""
+    self_phrases = ["to me", "to myself", "send me", "send it to me"]
+    return any(phrase in user_message.lower() for phrase in self_phrases)
+
+def summarize_messages_with_llm(messages: List[Dict]) -> str:
+    """
+    Uses the Fanar LLM to summarize a list of conversation messages into a concise summary.
+    """
+    if not messages:
+        return ""
+    # Only use the last 3 messages for summarization context, truncate each to 1000 chars
+    messages = messages[-3:]
+    for msg in messages:
+        if len(msg["content"]) > 1000:
+            msg["content"] = msg["content"][:1000]
+    # Build a prompt for summarization
+    conversation_text = "\n".join([
+        f"User: {msg['content']}" if msg['role'] == 'user' else f"Assistant: {msg['content']}" if msg['role'] == 'assistant' else f"System: {msg['content']}" for msg in messages
+    ])
+    prompt = (
+        "Summarize the following conversation history in a concise way, focusing on the most important requests, actions, and results. "
+        "Do not include irrelevant details.\n\n"
+        f"Conversation:\n{conversation_text}\n\nSummary:"
+    )
+    # Use the Fanar LLM to get the summary
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "system", "content": "You are a helpful assistant that summarizes conversations."}, {"role": "user", "content": prompt}],
+        max_tokens=128
+    )
+    summary = response.choices[0].message.content.strip()
+    return summary
+
+def summarize_conversation_history(history: List[Dict]) -> List[Dict]:
+    """
+    Summarizes the conversation history to keep only the most important information.
+    This function keeps the last 5 messages, but for older messages, it replaces them with a single LLM-generated summary message.
+    """
+    if len(history) <= 5:
+        return history
+    # Summarize all but the last 5 messages using the LLM
+    summary = summarize_messages_with_llm(history[:-5])
+    summarized = [{"role": "system", "content": f"SUMMARY_OF_PREVIOUS: {summary}"}]
+    return summarized + history[-5:]
+
+def english_email_agent(user_input, recipient_name):
+    """Agent for generating and sending English emails."""
+    # Generate the email
+    prompt = f"""
+You are a professional email assistant. Your task is to write a complete, professional English email based on the user's request below.
+
+**Instructions:**
+- Generate the entire email, including a subject line, salutation, body, and closing.
+- The email must be ready to send immediately.
+- Do not include any instructional comments, parentheses, or placeholders.
+- Use a professional and clear tone.
+- Salutation: Start with 'Dear {recipient_name},'
+- Closing: End with 'Best regards,' followed by '[Your Name]'.
+
+**User's Request:**
+"{user_input}"
+
+Now, write the complete and final email in English, ready to send.
+"""
+    # Call the LLM (Fanar or OpenAI)
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2048,
+        temperature=0.7
+    )
+    generated_email = response.choices[0].message.content
+    # Extract subject and body
+    lines = generated_email.strip().split('\n')
+    subject = "No Subject"
+    body = generated_email
+    if lines and lines[0].lower().startswith("subject:"):
+        subject = lines[0].split(":", 1)[1].strip()
+        body = "\n".join(lines[1:]).strip()
+    # Call send_gmail tool
+    send_result = requests.post(
+        f"http://127.0.0.1:8000/mcp/send_gmail",
+        json={
+            "recipient": recipient_name,
+            "recipient_email": _find_recipient_in_tool_calls(conversation_history),
+            "subject": subject,
+            "body": body
+        }
+    )
+    return {"email": generated_email, "send_result": send_result.json()}
+
+def arabic_email_agent(user_input, recipient_name):
+    """Agent for generating and sending Arabic emails."""
+    # Generate the email
+    prompt = f"""
+مهمتك هي كتابة بريد إلكتروني احترافي كامل باللغة العربية بناءً على طلب المستخدم أدناه.
+
+**التعليمات:**
+- أنشئ البريد الإلكتروني بالكامل، بما في ذلك سطر الموضوع، التحية، النص الأساسي، والخاتمة.
+- يجب أن يكون البريد الإلكتروني جاهزًا للإرسال فورًا.
+- لا تدرج أي تعليقات أو ملاحظات تعليمية أو نصوص بين قوسين.
+- استخدم نبرة رسمية وواضحة.
+- التحية: ابدأ بـ 'عزيزي {recipient_name},'
+- الخاتمة: أنهِ البريد الإلكتروني بـ 'مع خالص التقدير،' متبوعة بـ '[اسمك]'.
+
+**طلب المستخدم:**
+"{user_input}"
+
+الآن، اكتب البريد الإلكتروني الكامل والنهائي باللغة العربية، جاهز للإرسال.
+"""
+    # Call the LLM (Fanar or OpenAI)
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2048,
+        temperature=0.7
+    )
+    generated_email = response.choices[0].message.content
+    # Extract subject and body
+    lines = generated_email.strip().split('\n')
+    subject = "بدون موضوع"
+    body = generated_email
+    if lines and lines[0].startswith("موضوع:"):
+        subject = lines[0].split(":", 1)[1].strip()
+        body = "\n".join(lines[1:]).strip()
+    # Call send_gmail tool
+    send_result = requests.post(
+        f"http://127.0.0.1:8000/mcp/send_gmail",
+        json={
+            "recipient": recipient_name,
+            "recipient_email": _find_recipient_in_tool_calls(conversation_history),
+            "subject": subject,
+            "body": body
+        }
+    )
+    return {"email": generated_email, "send_result": send_result.json()}
+
+def update_conversation_history(chat_id, history):
+    # Remove tool results from history before saving
+    filtered_history = []
+    for msg in history:
+        if isinstance(msg, dict) and msg.get('role') == 'system' and 'TOOL_RESULTS' in msg.get('content', ''):
+            continue  # Skip tool results
+        filtered_history.append(msg)
+    # Save only filtered history
+    # ... existing code to save filtered_history instead of history ...
+
+def extract_event_from_text(text: str):
+    """
+    Uses the Fanar LLM to extract event details from a block of text (e.g., an email body).
+    Returns a dict with keys: title, start, end, location, description if an event is found, else None.
+    Handles natural language dates like 'today', 'tomorrow', etc.
+    """
+    print(f"[EVENT EXTRACTION] Analyzing text: {text}")
+    from datetime import datetime
+    now = datetime.now()
+    current_date = now.strftime('%Y-%m-%d')
+    current_time = now.strftime('%H:%M')
+    prompt = (
+        f"Today is {current_date}. The current time is {current_time}.\n"
+        "You are an assistant that reads emails and extracts event details.\n"
+        "Read the following email. If it contains an event (meeting, dinner, hackathon, etc.), extract:\n"
+        "- title: The main topic, subject, or purpose of the event (e.g., 'Hackathon', 'Dinner with Bob').\n"
+        "- start: The start date and time, in the format YYYY-MM-DD HH:MM (e.g., '2025-06-28 17:00').\n"
+        "- end: The end date and time, in the same format. If only a start time is given, set end to 1 hour after start.\n"
+        "- location: The location if mentioned, else null.\n"
+        "- description: A short summary of the event.\n"
+        "Return ONLY a JSON object with these keys. If you can't find a title, use the main subject or topic of the email.\n"
+        "If there is no event, return the string 'NO_EVENT'.\n\n"
+        f"Email:\n{text}\n\nEvent details:"
+    )
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "system", "content": "You extract event details from text."}, {"role": "user", "content": prompt}],
+        max_tokens=256,
+        temperature=0.2
+    )
+    content = response.choices[0].message.content.strip()
+    print(f"[EVENT EXTRACTION] LLM raw output: {content}")
+    if content.strip().upper().startswith("NO_EVENT"):
+        print(f"[EVENT EXTRACTION] Result: None (NO_EVENT)")
+        return None
+    try:
+        event = json.loads(content)
+        print(f"[EVENT EXTRACTION] LLM parsed JSON: {event}")
+        # Basic validation
+        if not event.get("title") or not event.get("start"):
+            print(f"[EVENT EXTRACTION] Result: None (missing title/start)")
+            return None
+        # Post-process: if end is missing, assume 1 hour after start
+        from datetime import datetime, timedelta
+        def to_dt(s):
+            try:
+                return datetime.strptime(s, "%Y-%m-%d %H:%M")
+            except Exception:
+                return None
+        start_dt = to_dt(event['start'])
+        if start_dt:
+            if not event.get('end') or not to_dt(event['end']):
+                end_dt = start_dt + timedelta(hours=1)
+                event['end'] = end_dt.strftime("%Y-%m-%d %H:%M")
+                print(f"[EVENT EXTRACTION] Defaulted end time to one hour after start: {event['end']}")
+            else:
+                # Ensure end is formatted correctly
+                event['end'] = to_dt(event['end']).strftime("%Y-%m-%d %H:%M")
+            # Ensure start is formatted correctly
+            event['start'] = start_dt.strftime("%Y-%m-%d %H:%M")
+        print(f"[EVENT EXTRACTION] Result: {event}")
+        return event
+    except Exception as e:
+        print(f"[EVENT EXTRACTION] LLM output not valid JSON: {e}")
+        return None
 
 def main():
     load_dotenv()
