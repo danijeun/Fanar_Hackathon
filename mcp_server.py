@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Body
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
 import os
@@ -8,6 +8,15 @@ from openai import OpenAI
 from datetime import datetime
 import pytz
 from tzlocal import get_localzone
+import json
+from telegram_bot import send_telegram_notification
+import asyncio
+import base64
+import serpapi
+import threading
+import time
+import logging
+import re
 
 # Gmail/Calendar OAuth2 imports
 from google.oauth2.credentials import Credentials
@@ -15,10 +24,13 @@ from googleapiclient.discovery import build
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
-import base64
-from serpapi import GoogleSearch
+from google.cloud import pubsub_v1
+from google.api_core.exceptions import AlreadyExists
+from concurrent.futures import TimeoutError
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 FANAR_API_KEY = os.getenv("FANAR_API_KEY")
 GMAIL_CLIENT_ID = os.getenv("GMAIL_CLIENT_ID")
 GMAIL_CLIENT_SECRET = os.getenv("GMAIL_CLIENT_SECRET")
@@ -26,6 +38,7 @@ GMAIL_REDIRECT_URI = os.getenv("GMAIL_REDIRECT_URI")
 GMAIL_REFRESH_TOKEN = os.getenv("GMAIL_REFRESH_TOKEN")
 CALENDAR_ID = "hackathonfanar@gmail.com"
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 app = FastAPI(title="MCP REST Server (FastAPI)")
 
@@ -85,17 +98,18 @@ class FormatEmailPayload(BaseModel):
     body: str
     recipient_name: Optional[str] = None
 
-class ImageGeneratePayload(BaseModel):
-    prompt: str
-
-class WebSearchPayload(BaseModel):
-    query: str
-
-class GenerateImageAndSendEmailPayload(BaseModel):
-    prompt: str
-    recipient: str
-    subject: str
+class FormatEnglishEmailPayload(BaseModel):
     body: str
+    recipient_name: str
+
+class FormatArabicEmailPayload(BaseModel):
+    body: str
+    recipient_name: str
+
+class EmailAgentPayload(BaseModel):
+    body: str
+    recipient_name: str
+    recipient_email: str
 
 def to_utc_iso(local_dt_str: str, local_fmt: str = "%Y-%m-%d %H:%M") -> str:
     """Converts a local datetime string to a UTC ISO formatted string for Google Calendar."""
@@ -111,29 +125,29 @@ def to_utc_iso(local_dt_str: str, local_fmt: str = "%Y-%m-%d %H:%M") -> str:
         raise HTTPException(status_code=400, detail=f"Invalid date format for '{local_dt_str}'. Please use 'YYYY-MM-DD HH:MM'.")
 
 @app.post("/mcp/translate_text")
-def mcp_translate_text(payload: TranslatePayload):
-    headers = {
-        "Authorization": f"Bearer {FANAR_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    json_data = {
-        "model": "Fanar-Shaheen-MT-1",
-        "text": payload.text,
-        "langpair": payload.langpair,
-        "preprocessing": payload.preprocessing,
-    }
+def mcp_translate_text(payload: dict):
+    """Translates text to a target language using the Fanar LLM."""
+    text = payload.get("text")
+    # Accept 'target_lang' (preferred) or fallback to 'langpair'
+    target_lang = payload.get("target_lang") or payload.get("langpair")
+    if not text or not target_lang:
+        raise HTTPException(status_code=422, detail="Both 'text' and 'target_lang' are required.")
+    prompt = f"Translate the following text to {target_lang}:\n\n{text}"
     try:
-        response = requests.post("https://api.fanar.qa/v1/translations", headers=headers, json=json_data)
-        response.raise_for_status()
-        return {"result": response.json()}
-    except requests.exceptions.RequestException as e:
-        status_code = response.status_code if 'response' in locals() else 500
-        error_message = f"Request Error: {str(e)}"
-        if 'response' in locals() and response.text:
-            error_message += f" - {response.text}"
-        raise HTTPException(status_code=status_code, detail=error_message)
+        print(f"[DEBUG] Translate prompt: {prompt}")
+        response = fanar_client.chat.completions.create(
+            model="Fanar-S-1-7B",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2048,
+            temperature=0.3
+        )
+        translated = response.choices[0].message.content
+        return {"result": "Text translated successfully", "translated": translated}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"API Error: {str(e)}")
+        print(f"[DEBUG] Exception in /mcp/translate_text: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"result": "[DEBUG] Exception occurred", "translated": f"[DEBUG] {str(e)}"}
 
 @app.post("/mcp/send_gmail")
 def mcp_send_gmail(payload: GmailPayload):
@@ -218,135 +232,183 @@ def mcp_list_calendar_events(payload: ListCalendarEventsPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to search events: {str(e)}")
 
-@app.post("/mcp/format_professional_arabic_email")
-def mcp_format_email(payload: FormatEmailPayload):
-    """Wraps text in a professional Arabic email format."""
-    salutation = "عزيزي"
-    if payload.recipient_name:
-        salutation = f"عزيزي {payload.recipient_name},"
 
-    closing = "مع خالص التقدير،"
+def check_new_emails():
+    """Periodically checks for new, unread emails and sends notifications."""
+    print("--- Starting Gmail polling thread ---")
     
-    formatted_body = f"""
-{salutation}
+    while True:
+        try:
+            if not TELEGRAM_CHAT_ID:
+                print("TELEGRAM_CHAT_ID not set, polling is disabled.")
+                time.sleep(60)
+                continue
 
-{payload.body}
-
-{closing}
-فريق فنار
-"""
-    return {"result": "Email body formatted.", "formatted_body": formatted_body.strip()}
-
-@app.post("/mcp/generate_image")
-def mcp_generate_image(payload: ImageGeneratePayload):
-    """Generates an image from a prompt."""
-    try:
-        response = fanar_client.images.generate(
-            model="Fanar-ImageGen-1",
-            prompt=payload.prompt,
-            response_format="b64_json"
-        )
-        image_b64 = response.data[0].b64_json
-        if not image_b64:
-            raise HTTPException(status_code=500, detail="API returned no image data.")
-        return {"result": "Image generated successfully", "image_b64": image_b64}
-    except Exception as e:
-        # Log the exception for debugging
-        print(f"Error in image generation: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate image: {str(e)}")
-
-@app.post("/mcp/web_search")
-def mcp_web_search(payload: WebSearchPayload):
-    """Performs a web search using SerpApi and returns the results."""
-    if not SERPAPI_API_KEY:
-        raise HTTPException(status_code=500, detail="SERPAPI_API_KEY not set in environment.")
-    
-    try:
-        params = {
-            "api_key": SERPAPI_API_KEY,
-            "q": payload.query,
-            "engine": "google",
-            "google_domain": "google.com",
-            "gl": "us",
-            "hl": "en"
-        }
-        search = GoogleSearch(params)
-        results = search.get_dict()
-        
-        # Extract and format the organic results
-        organic_results = results.get("organic_results", [])
-        formatted_results = []
-        for result in organic_results[:5]: # Get top 5 results
-            formatted_results.append({
-                "title": result.get("title"),
-                "link": result.get("link"),
-                "snippet": result.get("snippet")
-            })
+            print("... Checking for new emails ...")
             
-        return {"result": "Search completed", "results": formatted_results}
-        
-    except Exception as e:
-        print(f"Error in web search: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to perform web search: {str(e)}")
+            # Use .modify scope to be able to mark emails as read
+            service = _get_google_service("gmail", "v1", ["https://www.googleapis.com/auth/gmail.modify"])
+            
+            # List all unread messages in the inbox
+            results = service.users().messages().list(userId='me', q='is:unread in:inbox').execute()
+            messages = results.get('messages', [])
 
-@app.post("/mcp/generate_image_and_send_email")
-def mcp_generate_image_and_send_email(payload: GenerateImageAndSendEmailPayload):
-    """Generates an image and sends it in an email."""
-    try:
-        # Step 1: Generate the image by calling the other endpoint's function
-        image_payload = ImageGeneratePayload(prompt=payload.prompt)
-        image_response = mcp_generate_image(image_payload)
-        
-        image_b64 = image_response.get("image_b64")
-        if not image_b64:
-            raise HTTPException(status_code=500, detail="Image generation failed, no image data returned.")
+            if not messages:
+                print("... No new emails found.")
+            else:
+                print(f"--- Found {len(messages)} new email(s)! ---")
+                for msg_summary in messages:
+                    msg_id = msg_summary['id']
+                    
+                    # Fetch full message details
+                    full_message = service.users().messages().get(userId='me', id=msg_id).execute()
+                    headers = full_message['payload']['headers']
+                    subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
+                    sender = next((h['value'] for h in headers if h['name'].lower() == 'from'), 'Unknown Sender')
+                    # Extract the plain text body (if available)
+                    body = ''
+                    payload = full_message.get('payload', {})
+                    if 'parts' in payload:
+                        for part in payload['parts']:
+                            if part.get('mimeType') == 'text/plain':
+                                body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='ignore')
+                                break
+                    elif payload.get('mimeType') == 'text/plain':
+                        body = base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8', errors='ignore')
+                    notification_text = f"📬 New Email!\n\n*From:* {sender}\n*Subject:* {subject}"
+                    # Send notification with summarize button
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(send_telegram_notification(TELEGRAM_CHAT_ID, notification_text, email_body=body, subject=subject))
+                    loop.close()
+                    print(f"Sent notification for message ID: {msg_id}")
+                    # Mark the message as read by removing the 'UNREAD' label
+                    service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
 
-        # Step 2: Send the email with the image
-        email_payload = GmailPayload(
-            recipient=payload.recipient,
-            subject=payload.subject,
-            body=payload.body,
-            image_b64=image_b64
-        )
-        email_response = mcp_send_gmail(email_payload)
-        return email_response
+            # Wait for 30 seconds before checking again
+            time.sleep(30)
+            
+        except Exception as e:
+            print(f"An error occurred in the email polling thread: {e}")
+            # Wait longer before retrying if an error occurs
+            time.sleep(60)
 
-    except HTTPException as e:
-        # Re-raise HTTPException to propagate the error response
-        raise e
-    except Exception as e:
-        logger.error(f"Error in generate_image_and_send_email: {e}")
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
-def generate_image_and_send_email(prompt: str, recipient: str, subject: str, body: str):
-    """Generates an image and sends it in an email."""
-    try:
-        # Step 1: Generate the image
-        image_response = mcp_generate_image(ImageGeneratePayload(prompt=prompt))
-        if "error" in image_response:
-            return image_response  # Propagate the error
-        
-        image_b64 = image_response.get("image_b64")
-        if not image_b64:
-            return {"error": "Image generation failed, no image data returned."}
+@app.on_event("startup")
+def startup_event():
+    """On app startup, run the email poller in a separate thread."""
+    polling_thread = threading.Thread(target=check_new_emails, daemon=True)
+    polling_thread.start()
 
-        # Step 2: Send the email with the image
-        email_response = mcp_send_gmail(GmailPayload(
-            subject=subject,
-            body=body,
-            recipient=recipient,
-            image_b64=image_b64
-        ))
-        return email_response
+@app.post("/mcp/arabic_email_agent")
+def mcp_arabic_email_agent(payload: EmailAgentPayload):
+    # Self-send detection
+    user_body = payload.body or ""
+    if re.search(r"to myself|to me|to my email|send me an email|ارسل لي|ارسل الى بريدي", user_body, re.IGNORECASE):
+        payload.recipient_email = "hackathonfanar@gmail.com"
+    # Generic salutation if recipient_name is missing
+    recipient_name = payload.recipient_name.strip() if payload.recipient_name else None
+    if not recipient_name:
+        salutation = "عزيزي،"
+        salutation_instruction = "إذا لم يتم توفير اسم المستلم من قبل المستخدم بشكل صريح، استخدم فقط تحية عامة 'عزيزي،' ولا تحاول أبداً تخمين أو استنتاج اسم المستلم من البريد الإلكتروني أو السياق أو أي مصدر آخر. لا تكتب أي اسم أو نص بين قوسين أو أقواس زاوية أو مربعة أو أي صيغة مثل <اسم المستلم> أو [اسم المستلم]. لا تضع أي عنصر نائب أو نص توضيحي."
+    else:
+        salutation = f"عزيزي {recipient_name},"
+        salutation_instruction = ""
+    negative_instruction = "ممنوع تمامًا إضافة أي شروحات أو اعتذارات أو ذكر أنك نموذج لغوي أو أي عبارات توضيحية أو تبريرية أو محتوى مخترع. فقط أعد صياغة ونسق رسالة المستخدم الرئيسية كبريد إلكتروني احترافي، وانقل نية المستخدم الأصلية فقط، ولا شيء أكثر."
+    subject_instruction = "يجب أن تبدأ كل رسالة بريد إلكتروني بسطر موضوع واضح في الأعلى، مكتوب هكذا: 'موضوع: ...'، ولا يجوز ترك الموضوع فارغًا أبدًا."
+    prompt = f"""
+مهمتك هي كتابة بريد إلكتروني احترافي كامل باللغة العربية بناءً بدقة على طلب المستخدم أدناه.
 
-    except Exception as e:
-        logger.error(f"Error in generate_image_and_send_email: {e}")
-        return {"error": str(e)}
+**التعليمات:**
+- أنشئ البريد الإلكتروني بالكامل، بما في ذلك سطر الموضوع، التحية، النص الأساسي، والخاتمة.
+- يجب أن يكون البريد الإلكتروني جاهزًا للإرسال فورًا.
+- لا تدرج أي تعليقات أو ملاحظات تعليمية أو نصوص بين قوسين أو أقواس زاوية أو مربعة أو عناصر نائبة.
+- استخدم نبرة رسمية وواضحة.
+- التحية: ابدأ بـ '{salutation}'
+- الخاتمة: أنهِ البريد الإلكتروني بـ 'مع خالص التقدير،' متبوعة بـ 'فَنار'.
+- لا تجب أو تشرح أو تضف اقتراحات على طلب المستخدم. لا تخترع أو تقترح حلولاً. فقط أعد صياغة ونسق رسالة المستخدم الرئيسية كبريد إلكتروني احترافي. يجب أن ينقل الناتج نية المستخدم الأصلية فقط، ولا شيء أكثر.
+{salutation_instruction}
+{negative_instruction}
+{subject_instruction}
 
-def translate_text(text: str, target_lang: str):
-    """Translates text to a target language."""
-    # ... existing code ...
-    return {"result": "Translation completed", "translated_text": translated_text}
+**طلب المستخدم:**
+"{payload.body}"
+
+الآن، اكتب البريد الإلكتروني الكامل والنهائي باللغة العربية، جاهز للإرسال. لا تضف أي شيء غير موجود في رسالة المستخدم.
+"""
+    response = fanar_client.chat.completions.create(
+        model="Fanar-S-1-7B",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2048,
+        temperature=0.7
+    )
+    generated_email = response.choices[0].message.content
+    lines = generated_email.strip().split('\n')
+    subject = "بدون موضوع"
+    body = generated_email
+    if lines and lines[0].startswith("موضوع:"):
+        subject = lines[0].split(":", 1)[1].strip()
+        body = "\n".join(lines[1:]).strip()
+    else:
+        # Prepend default subject if missing
+        body = f"موضوع: {subject}\n" + body
+    # Do NOT send the email, just return the draft
+    return {"email": generated_email, "subject": subject, "body": body}
+
+@app.post("/mcp/english_email_agent")
+def mcp_english_email_agent(payload: EmailAgentPayload):
+    # Self-send detection
+    user_body = payload.body or ""
+    if re.search(r"to myself|to me|to my email|send me an email|ارسل لي|ارسل الى بريدي", user_body, re.IGNORECASE):
+        payload.recipient_email = "hackathonfanar@gmail.com"
+    # Generic salutation if recipient_name is missing
+    recipient_name = payload.recipient_name.strip() if payload.recipient_name else None
+    if not recipient_name:
+        salutation = "Dear,"
+        salutation_instruction = "If the user does NOT explicitly provide a recipient name, use ONLY a generic salutation 'Dear,'. NEVER guess, invent, or infer a name from the email address or context. Do not write any name, placeholder, or text in brackets, angle brackets, or like <Recipient's Name> or [Recipient's Name]. Do not include any placeholder or instructional text."
+    else:
+        salutation = f"Dear {recipient_name},"
+        salutation_instruction = ""
+    negative_instruction = "You must NEVER add explanations, disclaimers, or say you are a language model. Do NOT invent, elaborate, or add any content not present in the user's request. Never guess or infer a name. Only restate, rephrase, and format the user's main message as a professional email. The output must only convey the user's original intent, nothing more."
+    subject_instruction = "Every email must start with a clear subject line at the very top, formatted as: 'Subject: ...'. The subject must never be omitted or left blank."
+    prompt = f"""
+You are a professional email assistant. Your task is to write a complete, professional English email based strictly on the user's request below.
+
+**Instructions:**
+- Generate the entire email, including a subject line, salutation, body, and closing.
+- The email must be ready to send immediately.
+- Do not include any instructional comments, parentheses, brackets, angle brackets, or placeholders.
+- Use a professional and clear tone.
+- Salutation: Start with '{salutation}'
+- Closing: End with 'Best regards,' followed by 'Fanar'.
+- Do NOT answer, elaborate, or add suggestions to the user's query. Do NOT invent or propose solutions. Only restate, rephrase, and format the user's main message as a professional email. The output must only convey the user's original intent, nothing more.
+{salutation_instruction}
+{negative_instruction}
+{subject_instruction}
+
+**User's Request:**
+"{payload.body}"
+
+Now, write the complete and final email in English, ready to send. Do not add anything that is not in the user's message.
+"""
+    response = fanar_client.chat.completions.create(
+        model="Fanar-S-1-7B",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2048,
+        temperature=0.7
+    )
+    generated_email = response.choices[0].message.content
+    lines = generated_email.strip().split('\n')
+    subject = "No Subject"
+    body = generated_email
+    if lines and lines[0].lower().startswith("subject:"):
+        subject = lines[0].split(":", 1)[1].strip()
+        body = "\n".join(lines[1:]).strip()
+    else:
+        # Prepend default subject if missing
+        body = f"Subject: {subject}\n" + body
+    # Do NOT send the email, just return the draft
+    return {"email": generated_email, "subject": subject, "body": body}
 
 if __name__ == "__main__":
     import uvicorn

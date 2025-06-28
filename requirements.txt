@@ -19,3 +19,6 @@ tzlocal
 pydantic
 nest-asyncio
 pydub
+
+# New dependencies
+google-cloud-pubsub

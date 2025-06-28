@@ -1,0 +1,24 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+
+# macOS
+.DS_Store
+
+# SQLite DB and local state
+bot_memory.db
+
+# VSCode and IDE settings
+.vscode/
+.idea/
+
+# Test and coverage output
+test-results/
+coverage/
+*.cover
+
+# Other
+*.log 
