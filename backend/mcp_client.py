@@ -10,32 +10,34 @@ import logging
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
 
-KNOWN_TOOLS = {
+# Define which tools are handled by which server
+MAIN_SERVER_TOOLS = {
     "list_calendar_events",
     "create_calendar_event",
     "send_gmail",
     "translate_text",
-    "generate_image",
     "format_professional_arabic_email",
+    "generate_email_and_send_email",
+    "generate_email",
+}
+TOOLS_SERVER_TOOLS = {
+    "generate_image",
     "web_search",
-    "generate_image_and_send_email",
 }
 
 class MCPClient:
-    """Client for interacting with an external MCP server via HTTP POST."""
-    def __init__(self, server_url=None):
-        self.server_url = server_url or os.getenv("MCP_SERVER_URL") or "http://127.0.0.1:8000"
-        if not self.server_url:
+    """Client for interacting with the MCP servers via HTTP POST."""
+    def __init__(self, main_server_url=None, tools_server_url=None):
+        self.main_server_url = main_server_url or os.getenv("MCP_SERVER_URL") or "http://127.0.0.1:8000"
+        self.tools_server_url = tools_server_url or os.getenv("MCP_TOOLS_SERVER_URL") or "http://127.0.0.1:8010"
+        if not self.main_server_url:
             raise ValueError("MCP_SERVER_URL not set in environment.")
         self.tools = {
             "send_gmail": {"description": "Sends an email via Gmail.", "payload": {"recipient": "email", "subject": "str", "body": "str", "image_b64": "str (optional)"}},
             "list_calendar_events": {"description": "Lists events from Google Calendar.", "payload": {"when": "str ('today' or 'tomorrow')"}},
             "create_calendar_event": {"description": "Creates an event in Google Calendar.", "payload": {"summary": "str", "start": "str (YYYY-MM-DD HH:MM)", "end": "str (YYYY-MM-DD HH:MM)"}},
             "translate_text": {"description": "Translates text to a target language.", "payload": {"text": "str", "target_lang": "str (e.g., 'ar')"}},
-            "generate_image": {"description": "Generates an image from a text prompt.", "payload": {"prompt": "str"}},
-            "format_professional_arabic_email": {"description": "Formats text into a professional Arabic email.", "payload": {"body": "str", "recipient_name": "str (optional)"}},
-            "web_search": {"description": "Performs a web search using Google.", "payload": {"query": "str"}},
-            "generate_image_and_send_email": {
+            "generate_email_and_send_email": {
                 "description": "Generates an image from a text prompt and sends it to an email address.",
                 "payload": {
                     "prompt": "str",
@@ -43,7 +45,25 @@ class MCPClient:
                     "subject": "str",
                     "body": "str"
                 }
-            }
+            },
+            "arabic_email_agent": {"description": "Generates a professional Arabic email and sends it.", "payload": {"body": "str", "recipient_name": "str"}},
+            "english_email_agent": {"description": "Generates a professional English email and sends it.", "payload": {"body": "str", "recipient_name": "str"}},
+            # The following are only available on the tools server:
+            "generate_image": {"description": "Generates an image from a text prompt.", "payload": {"prompt": "str"}},
+            "web_search": {"description": "Performs a web search using Google.", "payload": {"query": "str"}},
+        }
+        # Map tool names to the correct server (main or tools)
+        self.tool_server_map = {
+            'send_gmail': self.main_server_url,
+            'list_calendar_events': self.main_server_url,
+            'create_calendar_event': self.main_server_url,
+            'translate_text': self.main_server_url,
+            'arabic_email_agent': self.main_server_url,
+            'english_email_agent': self.main_server_url,
+            # Tools server:
+            'generate_image': self.tools_server_url,
+            'web_search': self.tools_server_url,
+            'generate_image_and_send_email': self.tools_server_url,
         }
 
     def get_tools_json_for_prompt(self, tool_names):
@@ -52,15 +72,20 @@ class MCPClient:
         return json.dumps(subset_tools, indent=2)
 
     def execute_tool(self, tool_name, payload):
-        """Executes a tool by calling the MCP server."""
+        """Executes a tool by calling the appropriate MCP server."""
         if tool_name not in self.tools:
             return {"error": f"Tool '{tool_name}' not found."}
-            
         headers = {"Content-Type": "application/json"}
-        url = f"{self.server_url}/mcp/{tool_name}"
+        # Decide which server to use
+        if tool_name in ("english_email_agent", "arabic_email_agent", "send_gmail", "list_calendar_events", "create_calendar_event", "translate_text"):
+            url = f"{self.main_server_url}/mcp/{tool_name}"
+        elif tool_name in ("generate_image", "web_search", "generate_image_and_send_email"):
+            url = f"{self.tools_server_url}/mcp/{tool_name}"
+        else:
+            return {"error": f"Tool '{tool_name}' is not assigned to any server."}
         print(f"[DEBUG] MCPClient calling URL: {url} with payload: {payload}")
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=20) # Increased timeout
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.ConnectionError as ce:

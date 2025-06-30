@@ -12,6 +12,12 @@ import base64
 import requests
 from typing import List, Dict
 from backend.utils import resolve_natural_date  # Import for fallback date resolution
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 def get_utc_iso_range(when="today"):
     """
@@ -122,6 +128,7 @@ def get_completion(messages):
     return content
 
 def get_agent_response(user_input, conversation_history):
+    logging.info(f"User input: {user_input}")
     conversation_history.append({"role": "user", "content": user_input})
     mcp_client = MCPClient()
 
@@ -148,15 +155,12 @@ def get_agent_response(user_input, conversation_history):
             *truncated_msgs
         ]
 
-        # Debug: print the messages sent to the agent
-        print("\n--- DEBUG: Messages sent to agent ---")
-        for m in messages:
-            print(m)
-        print("--- END DEBUG ---\n")
+        logging.info(f"Messages sent to agent: {messages}")
 
         # Step 2: Get the agent's response (which could be text or a tool call)
         print("\n--- 1. Agent is thinking... ---")
         agent_response_text = get_completion(messages)
+        logging.info(f"Agent's raw response: {agent_response_text}")
         print(f"--- 2. Agent's raw response: ---\n{agent_response_text}\n--------------------")
         conversation_history.append({"role": "assistant", "content": agent_response_text})
         
@@ -169,12 +173,13 @@ def get_agent_response(user_input, conversation_history):
             json_blocks = re.findall(r'```json\s*(\{.*?\})\s*```', agent_response_text, re.DOTALL)
             
             if not json_blocks:
-                # If no tool call is detected, just return the agent's plain text response
+                logging.info(f"Final response to UI (no tool call): {agent_response_text}")
                 return agent_response_text, None, conversation_history
             
             if json_blocks:
                 all_results = []
                 parsed_tool_calls = [json.loads(block) for block in json_blocks]
+                logging.info(f"Parsed tool calls: {parsed_tool_calls}")
 
                 # --- Pre-processing Step ---
                 last_user_message = ""
@@ -246,23 +251,9 @@ def get_agent_response(user_input, conversation_history):
                     try:
                         tool_name = tool_data.get("tool")
                         payload = tool_data.get("payload", {})
-                        # Pre-process payload for calendar tools if needed
-                        if tool_name in ["create_calendar_event", "list_calendar_events"]:
-                            for key in ['start', 'end', 'when']:
-                                if key in payload and isinstance(payload[key], str):
-                                    time_str = payload[key]
-                                    if time_str in ["today", "tomorrow"]:
-                                        if tool_name == "list_calendar_events":
-                                            start, end = get_utc_iso_range(time_str)
-                                            payload['timeMin'], payload['timeMax'] = start, end
-                                    else:
-                                        dt_obj = parse_special_time_format(time_str)
-                                        if dt_obj:
-                                            payload[key] = dt_obj.strftime("%Y-%m-%dT%H:%M:%SZ")
-                        # --- Execute the tool ---
-                        print(f"--- 3. Executing tool: {tool_name} with payload: {payload} ---")
+                        logging.info(f"Executing tool: {tool_name} with payload: {payload}")
                         result = mcp_client.execute_tool(tool_name, payload)
-                        print(f"--- 4. Tool result: ---\n{result}\n--------------------")
+                        logging.info(f"Tool result for {tool_name}: {result}")
                         all_results.append({"tool": tool_name, "result": result})
                         # If this is an image, we need to handle the media response immediately
                         if tool_name == "generate_image" and isinstance(result, dict) and "image_b64" in result:
@@ -283,6 +274,7 @@ def get_agent_response(user_input, conversation_history):
                         sanitized_results.append(res)
                 
                 conversation_history.append({"role": "system", "content": f"TOOL_RESULTS: {json.dumps(sanitized_results)}"})
+                logging.info(f"Tool results appended to history: {sanitized_results}")
 
                 # Improved summary logic
                 error_messages = []
@@ -397,6 +389,18 @@ def get_agent_response(user_input, conversation_history):
                                     success_messages.append("No readable web search summaries found.")
                             else:
                                 success_messages.append("No web search results found.")
+                        elif tool == "english_email_agent":
+                            final_english_email = result.get("email")
+                            if final_english_email:
+                                success_messages.append(f"Here is your email draft:\n\n{final_english_email}")
+                            else:
+                                success_messages.append("The English email draft was generated successfully.")
+                        elif tool == "arabic_email_agent":
+                            final_arabic_email = result.get("email")
+                            if final_arabic_email:
+                                success_messages.append(f"Here is your email draft:\n\n{final_arabic_email}")
+                            else:
+                                success_messages.append("The Arabic email draft was generated successfully.")
                         else:
                             success_messages.append(f"{tool} completed successfully.")
                 # If there are errors but the LLM's response contains a valid answer, show both
@@ -423,15 +427,17 @@ def get_agent_response(user_input, conversation_history):
                 else:
                     # Fallback: show the agent's raw response if nothing else
                     final_text = agent_response_text
-                print(f"--- 6. Final summary response: ---\n{final_text}\n--------------------")
+                logging.info(f"Final response to UI: {final_text}")
                 conversation_history.append({"role": "assistant", "content": final_text})
 
         except Exception as e:
             final_text = "I'm sorry, there was an error processing the tool request."
+            logging.error(f"Exception in tool processing: {e}")
         
         return final_text, final_media, conversation_history
 
     except Exception as e:
+        logging.error(f"Critical error in get_agent_response: {e}")
         return "I'm sorry, a critical error occurred. Please try your request again.", None, conversation_history
 
 def generate_image_from_prompt(prompt: str):
