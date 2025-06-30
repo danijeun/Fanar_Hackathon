@@ -286,7 +286,7 @@ def check_new_emails():
                     service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
 
             # Wait for 30 seconds before checking again
-            time.sleep(30)
+            time.sleep(10)
             
         except Exception as e:
             print(f"An error occurred in the email polling thread: {e}")
