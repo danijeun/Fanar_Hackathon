@@ -25,7 +25,7 @@ You are Sa'i, a helpful AI assistant. Follow these rules:
 Today's date: {{{{current_date}}}}
 
 Available Tools:
-{MCPClient().get_tools_json_for_prompt(['list_calendar_events', 'create_calendar_event', 'send_gmail', 'arabic_email_agent', 'english_email_agent', 'generate_image', 'web_search'])}
+{MCPClient().get_tools_json_for_prompt(['list_calendar_events', 'create_calendar_event', 'arabic_email_agent', 'english_email_agent', 'generate_image', 'web_search'])}
 
 Examples:
 User: "Send an email to Bob about the project update."

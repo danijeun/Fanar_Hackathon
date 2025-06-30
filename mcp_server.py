@@ -337,7 +337,7 @@ def mcp_arabic_email_agent(payload: EmailAgentPayload):
 الآن، اكتب البريد الإلكتروني الكامل والنهائي باللغة العربية، جاهز للإرسال. لا تضف أي شيء غير موجود في رسالة المستخدم.
 """
     response = fanar_client.chat.completions.create(
-        model="Fanar-S-1-7B",
+        model="Fanar-C-1-8.7B",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=2048,
         temperature=0.7
@@ -392,7 +392,7 @@ You are a professional email assistant. Your task is to write a complete, profes
 Now, write the complete and final email in English, ready to send. Do not add anything that is not in the user's message.
 """
     response = fanar_client.chat.completions.create(
-        model="Fanar-S-1-7B",
+        model="Fanar-C-1-8.7B",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=2048,
         temperature=0.7
