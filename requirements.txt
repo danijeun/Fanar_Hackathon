@@ -22,3 +22,4 @@ pydub
 
 # New dependencies
 google-cloud-pubsub
+python-dateutil

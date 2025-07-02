@@ -14,11 +14,9 @@ logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
 MAIN_SERVER_TOOLS = {
     "list_calendar_events",
     "create_calendar_event",
+    "arabic_email_agent",
+    "english_email_agent",
     "send_gmail",
-    "translate_text",
-    "format_professional_arabic_email",
-    "generate_email_and_send_email",
-    "generate_email",
 }
 TOOLS_SERVER_TOOLS = {
     "generate_image",
@@ -33,23 +31,22 @@ class MCPClient:
         if not self.main_server_url:
             raise ValueError("MCP_SERVER_URL not set in environment.")
         self.tools = {
-            "send_gmail": {"description": "Sends an email via Gmail.", "payload": {"recipient": "email", "subject": "str", "body": "str", "image_b64": "str (optional)"}},
-            "list_calendar_events": {"description": "Lists events from Google Calendar.", "payload": {"when": "str ('today' or 'tomorrow')"}},
+            "list_calendar_events": {"description": "Lists events from Google Calendar.", "payload": {"when": "str ('YYYY-MM-DD HH:MM')"}},
             "create_calendar_event": {"description": "Creates an event in Google Calendar.", "payload": {"summary": "str", "start": "str (YYYY-MM-DD HH:MM)", "end": "str (YYYY-MM-DD HH:MM)"}},
             "arabic_email_agent": {"description": "Generates a professional Arabic email and sends it.", "payload": {"body": "str", "recipient_name": "str"}},
             "english_email_agent": {"description": "Generates a professional English email and sends it.", "payload": {"body": "str", "recipient_name": "str"}},
+            "send_gmail": {"description": "Sends an email via Gmail.", "payload": {"recipient": "email", "subject": "str", "body": "str", "image_b64": "str (optional)"}},
             # The following are only available on the tools server:
             "generate_image": {"description": "Generates an image from a text prompt.", "payload": {"prompt": "str"}},
             "web_search": {"description": "Performs a web search using Google.", "payload": {"query": "str"}},
         }
         # Map tool names to the correct server (main or tools)
         self.tool_server_map = {
-            'send_gmail': self.main_server_url,
             'list_calendar_events': self.main_server_url,
             'create_calendar_event': self.main_server_url,
-            'translate_text': self.main_server_url,
             'arabic_email_agent': self.main_server_url,
             'english_email_agent': self.main_server_url,
+            'send_gmail': self.main_server_url,
             # Tools server:
             'generate_image': self.tools_server_url,
             'web_search': self.tools_server_url
@@ -66,9 +63,9 @@ class MCPClient:
             return {"error": f"Tool '{tool_name}' not found."}
         headers = {"Content-Type": "application/json"}
         # Decide which server to use
-        if tool_name in ("english_email_agent", "arabic_email_agent", "send_gmail", "list_calendar_events", "create_calendar_event", "translate_text"):
+        if tool_name in ("english_email_agent", "arabic_email_agent", "list_calendar_events", "create_calendar_event", "send_gmail"):
             url = f"{self.main_server_url}/mcp/{tool_name}"
-        elif tool_name in ("generate_image", "web_search", "generate_image_and_send_email"):
+        elif tool_name in ("generate_image", "web_search"):
             url = f"{self.tools_server_url}/mcp/{tool_name}"
         else:
             return {"error": f"Tool '{tool_name}' is not assigned to any server."}

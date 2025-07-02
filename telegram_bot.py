@@ -317,9 +317,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Get the agent's response
     # Since get_agent_response is not an async function, we run it in a thread
     loop = asyncio.get_event_loop()
-    text_response, media_response, updated_history = await loop.run_in_executor(
+    result = await loop.run_in_executor(
         None, get_agent_response, user_input, history
     )
+    if not isinstance(result, (list, tuple)) or len(result) != 3:
+        logger.error(f"get_agent_response returned unexpected result: {result}")
+        text_response, media_response, updated_history = str(result), None, history
+    else:
+        text_response, media_response, updated_history = result
 
     # Summarize before saving
     summarized_history = summarize_conversation_history(updated_history)

@@ -17,6 +17,7 @@ import threading
 import time
 import logging
 import re
+from dateutil import parser as dateutil_parser
 
 # Gmail/Calendar OAuth2 imports
 from google.oauth2.credentials import Credentials
@@ -27,6 +28,9 @@ from email.mime.multipart import MIMEMultipart
 from google.cloud import pubsub_v1
 from google.api_core.exceptions import AlreadyExists
 from concurrent.futures import TimeoutError
+
+# Import from backend.app
+from backend.app import get_utc_iso_range
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -70,11 +74,6 @@ fanar_client = OpenAI(
     api_key=FANAR_API_KEY,
 )
 
-class TranslatePayload(BaseModel):
-    text: str
-    langpair: str
-    preprocessing: str = "default"
-
 class GmailPayload(BaseModel):
     subject: str
     body: str
@@ -112,42 +111,32 @@ class EmailAgentPayload(BaseModel):
     recipient_email: str
 
 def to_utc_iso(local_dt_str: str, local_fmt: str = "%Y-%m-%d %H:%M") -> str:
-    """Converts a local datetime string to a UTC ISO formatted string for Google Calendar."""
+    """
+    Converts a local datetime string (with or without timezone) to a UTC ISO formatted string for Google Calendar.
+    Accepts ISO 8601 with or without timezone, or 'YYYY-MM-DD HH:MM'.
+    """
     try:
-        local_dt = datetime.strptime(local_dt_str, local_fmt)
-        local_tz = get_localzone()
-        local_aware = local_tz.localize(local_dt) if hasattr(local_tz, 'localize') else local_dt.replace(tzinfo=local_tz)
-        utc_dt = local_aware.astimezone(pytz.UTC)
+        # Try parsing with dateutil (handles ISO 8601 and timezones)
+        dt = dateutil_parser.parse(local_dt_str)
+        # Convert to UTC
+        utc_dt = dt.astimezone(pytz.UTC)
         return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    except (ValueError, TypeError) as e:
-        print(f"[ERROR] Could not parse date string '{local_dt_str}'. Error: {e}")
-        # Re-raise as HTTPException so the client gets a clean error
-        raise HTTPException(status_code=400, detail=f"Invalid date format for '{local_dt_str}'. Please use 'YYYY-MM-DD HH:MM'.")
-
-@app.post("/mcp/translate_text")
-def mcp_translate_text(payload: dict):
-    """Translates text to a target language using the Fanar LLM."""
-    text = payload.get("text")
-    # Accept 'target_lang' (preferred) or fallback to 'langpair'
-    target_lang = payload.get("target_lang") or payload.get("langpair")
-    if not text or not target_lang:
-        raise HTTPException(status_code=422, detail="Both 'text' and 'target_lang' are required.")
-    prompt = f"Translate the following text to {target_lang}:\n\n{text}"
-    try:
-        print(f"[DEBUG] Translate prompt: {prompt}")
-        response = fanar_client.chat.completions.create(
-            model="Fanar-S-1-7B",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=2048,
-            temperature=0.3
-        )
-        translated = response.choices[0].message.content
-        return {"result": "Text translated successfully", "translated": translated}
-    except Exception as e:
-        print(f"[DEBUG] Exception in /mcp/translate_text: {e}")
-        import traceback
-        traceback.print_exc()
-        return {"result": "[DEBUG] Exception occurred", "translated": f"[DEBUG] {str(e)}"}
+    except Exception:
+        # Fallback to old logic
+        formats_to_try = ["%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"]
+        last_error = None
+        for fmt in formats_to_try:
+            try:
+                local_dt = datetime.strptime(local_dt_str, fmt)
+                local_tz = get_localzone()
+                local_aware = local_tz.localize(local_dt) if hasattr(local_tz, 'localize') else local_dt.replace(tzinfo=local_tz)
+                utc_dt = local_aware.astimezone(pytz.UTC)
+                return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            except (ValueError, TypeError) as e:
+                last_error = e
+                continue
+        print(f"[ERROR] Could not parse date string '{local_dt_str}'. Error: {last_error}")
+        raise HTTPException(status_code=400, detail=f"Invalid date format for '{local_dt_str}'. Please use 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DDTHH:MM[:SS]'.")
 
 @app.post("/mcp/send_gmail")
 def mcp_send_gmail(payload: GmailPayload):
@@ -211,6 +200,7 @@ def mcp_create_calendar_event(payload: CreateCalendarEventPayload):
 
 @app.post("/mcp/list_calendar_events")
 def mcp_list_calendar_events(payload: ListCalendarEventsPayload):
+    print(f"[DEBUG] Incoming payload: {payload}")
     service = _get_google_service("calendar", "v3", ["https://www.googleapis.com/auth/calendar"])
     try:
         list_params = {
@@ -220,16 +210,50 @@ def mcp_list_calendar_events(payload: ListCalendarEventsPayload):
             "singleEvents": True,
             "orderBy": "startTime"
         }
-        
-        if payload.time_min:
-            list_params["timeMin"] = payload.time_min
-        if payload.time_max:
-            list_params["timeMax"] = payload.time_max
-            
+        # --- Natural language datetime handling ---
+        when = getattr(payload, 'when', None) or (hasattr(payload, 'dict') and payload.dict().get('when'))
+        if when:
+            time_min, time_max = get_utc_iso_range(when)
+            list_params["timeMin"] = time_min
+            list_params["timeMax"] = time_max
+            print(f"[DEBUG] Using when='{when}': timeMin={time_min}, timeMax={time_max}")
+        else:
+            if payload.time_min:
+                list_params["timeMin"] = payload.time_min
+            if payload.time_max:
+                list_params["timeMax"] = payload.time_max
+        print(f"[DEBUG] list_calendar_events: list_params={list_params}")
         events_result = service.events().list(**list_params).execute()
+        print(f"[DEBUG] list_calendar_events: events_result={json.dumps(events_result, indent=2)}")
         events = events_result.get("items", [])
-        return {"result": "Events found", "events": events}
+        print(f"[DEBUG] list_calendar_events: found {len(events)} events")
+
+        # --- Fanar LLM summarization ---
+        user_query = getattr(payload, 'user_query', None) or getattr(payload, 'query', None) or "List my calendar events."
+        events_json = json.dumps(events, ensure_ascii=False, indent=2)
+        prompt = (
+            f"User's request: {user_query}\n"
+            f"Here is a list of calendar events in JSON format:\n{events_json}\n"
+            "Please summarize all the events for the user in a clear, concise, and human-friendly way. "
+            "If there are no events, say so. Otherwise, list each event with its title and time."
+            f"Today's date: {datetime.now().strftime('%Y-%m-%d')}"
+        )
+        try:
+            response = fanar_client.chat.completions.create(
+                model="Fanar-C-1-8.7B",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=512,
+                temperature=0.2
+            )
+            summary = response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"[ERROR] Fanar LLM summarization failed: {e}")
+            summary = None
+        return {"result": "Events found", "events": events, "summary": summary}
     except Exception as e:
+        import traceback
+        print(f"[ERROR] list_calendar_events: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to search events: {str(e)}")
 
 
