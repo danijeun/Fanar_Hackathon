@@ -88,10 +88,12 @@ class CreateCalendarEventPayload(BaseModel):
     location: Optional[str] = None
 
 class ListCalendarEventsPayload(BaseModel):
-    query: Optional[str] = None
+    start: Optional[str] = None  # Start datetime (YYYY-MM-DD HH:MM)
+    end: Optional[str] = None    # End datetime (YYYY-MM-DD HH:MM)
     max_results: int = 10
-    time_min: Optional[str] = None
-    time_max: Optional[str] = None
+    query: Optional[str] = None
+    time_min: Optional[str] = None  # For backward compatibility
+    time_max: Optional[str] = None  # For backward compatibility
 
 class FormatEmailPayload(BaseModel):
     body: str
@@ -210,34 +212,122 @@ def mcp_list_calendar_events(payload: ListCalendarEventsPayload):
             "singleEvents": True,
             "orderBy": "startTime"
         }
-        # --- Natural language datetime handling ---
-        when = getattr(payload, 'when', None) or (hasattr(payload, 'dict') and payload.dict().get('when'))
-        if when:
-            time_min, time_max = get_utc_iso_range(when)
-            list_params["timeMin"] = time_min
-            list_params["timeMax"] = time_max
-            print(f"[DEBUG] Using when='{when}': timeMin={time_min}, timeMax={time_max}")
-        else:
-            if payload.time_min:
-                list_params["timeMin"] = payload.time_min
-            if payload.time_max:
-                list_params["timeMax"] = payload.time_max
+        # Prefer explicit start/end, then time_min/time_max, then fallback
+        if payload.start:
+            list_params["timeMin"] = to_utc_iso(payload.start)
+        elif payload.time_min:
+            list_params["timeMin"] = payload.time_min
+        if payload.end:
+            list_params["timeMax"] = to_utc_iso(payload.end)
+        elif payload.time_max:
+            list_params["timeMax"] = payload.time_max
+
+        # Use user_query as fallback if query is None
+        user_query = getattr(payload, 'query', None)
+        if not user_query and hasattr(payload, 'dict'):
+            user_query = payload.dict().get('query')
+        if not user_query:
+            # Try to use a fallback, e.g., the stringified payload or a specific field
+            user_query = str(payload)
+            print("[WARNING] User query not found in payload; using fallback:", user_query)
+
+        # If neither timeMin nor timeMax is set, try to extract time from query (e.g., 'from 8 pm')
+        if not list_params.get("timeMin") and not list_params.get("timeMax"):
+            extracted_time = None
+            if user_query:
+                import re
+                # Match 'from X pm', 'after X pm', 'from X am', 'after X am', 'from HH:MM', 'after HH:MM'
+                match = re.search(r'(?:from|after)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', user_query, re.IGNORECASE)
+                if match:
+                    hour = int(match.group(1))
+                    minute = int(match.group(2)) if match.group(2) else 0
+                    ampm = match.group(3)
+                    if ampm:
+                        if ampm.lower() == 'pm' and hour != 12:
+                            hour += 12
+                        elif ampm.lower() == 'am' and hour == 12:
+                            hour = 0
+                    today = datetime.utcnow().date()
+                    extracted_time = datetime(today.year, today.month, today.day, hour, minute, 0, tzinfo=pytz.UTC)
+            if extracted_time:
+                time_min = extracted_time.isoformat().replace('+00:00', 'Z')
+                time_max = datetime(today.year, today.month, today.day, 23, 59, 59, tzinfo=pytz.UTC).isoformat().replace('+00:00', 'Z')
+                list_params["timeMin"] = time_min
+                list_params["timeMax"] = time_max
+                print(f"[DEBUG] Extracted time from query: timeMin={time_min}, timeMax={time_max}")
+            else:
+                today = datetime.utcnow().date()
+                time_min = datetime(today.year, today.month, today.day, 0, 0, 0, tzinfo=pytz.UTC).isoformat().replace('+00:00', 'Z')
+                time_max = datetime(today.year, today.month, today.day, 23, 59, 59, tzinfo=pytz.UTC).isoformat().replace('+00:00', 'Z')
+                list_params["timeMin"] = time_min
+                list_params["timeMax"] = time_max
+                print(f"[DEBUG] Defaulting to today's UTC: timeMin={time_min}, timeMax={time_max}")
+
         print(f"[DEBUG] list_calendar_events: list_params={list_params}")
         events_result = service.events().list(**list_params).execute()
         print(f"[DEBUG] list_calendar_events: events_result={json.dumps(events_result, indent=2)}")
         events = events_result.get("items", [])
         print(f"[DEBUG] list_calendar_events: found {len(events)} events")
 
+        # --- Strict date filtering ---
+        time_min = list_params.get("timeMin")
+        time_max = list_params.get("timeMax")
+        filtered_events = []
+        time_min_dt = dateutil_parser.parse(time_min) if time_min else None
+        time_max_dt = dateutil_parser.parse(time_max) if time_max else None
+        print(f"[DEBUG] Filtering: time_min_dt={time_min_dt}, time_max_dt={time_max_dt}")
+        for event in events:
+            start = event.get("start", {})
+            # Handle all-day events (date) and timed events (dateTime)
+            start_str = start.get("dateTime") or start.get("date")
+            if not start_str:
+                continue
+            # All-day events (date) are in 'YYYY-MM-DD' format, treat as UTC midnight
+            if "T" not in start_str:
+                start_dt = datetime.strptime(start_str, "%Y-%m-%d").replace(tzinfo=pytz.UTC)
+            else:
+                start_dt = dateutil_parser.parse(start_str)
+                if not start_dt.tzinfo:
+                    start_dt = start_dt.replace(tzinfo=pytz.UTC)
+                else:
+                    start_dt = start_dt.astimezone(pytz.UTC)
+            include_event = False
+            # Filtering logic
+            if time_min_dt and time_max_dt:
+                if time_min_dt <= start_dt <= time_max_dt:
+                    include_event = True
+            elif time_min_dt:
+                if start_dt >= time_min_dt:
+                    include_event = True
+            elif time_max_dt:
+                if start_dt <= time_max_dt:
+                    include_event = True
+            else:
+                include_event = True
+            print(f"[DEBUG] Event: {event.get('summary', 'No Title')} | start_dt={start_dt} | include={include_event}")
+            if include_event:
+                filtered_events.append(event)
+        print(f"[DEBUG] list_calendar_events: filtered {len(filtered_events)} events")
+
         # --- Fanar LLM summarization ---
-        user_query = getattr(payload, 'user_query', None) or getattr(payload, 'query', None) or "List my calendar events."
-        events_json = json.dumps(events, ensure_ascii=False, indent=2)
+        events_json = json.dumps(filtered_events, ensure_ascii=False, indent=2)
         prompt = (
+            f"Today's date: {datetime.now().strftime('%Y-%m-%d')}\n"
             f"User's request: {user_query}\n"
             f"Here is a list of calendar events in JSON format:\n{events_json}\n"
-            "Please summarize all the events for the user in a clear, concise, and human-friendly way. "
-            "If there are no events, say so. Otherwise, list each event with its title and time."
-            f"Today's date: {datetime.now().strftime('%Y-%m-%d')}"
+            "Please return all the events only from the requested dates in the query, in a visually appealing, clear, and human-friendly way.\n"
+            "Format the output using Markdown as follows:\n"
+            "- Start with a header like 'Your events for today:' or the relevant date.\n"
+            "- For each event, use a bullet point.\n"
+            "- Bold the event title using double asterisks (**).\n"
+            "- Show the start and end time in a human-friendly format (e.g., 'July 3, 2025, 21:00–23:00').\n"
+            "- If available, include the event description in italics using underscores (_).\n"
+            "- Use the event's local time if available, otherwise UTC.\n"
+            "- Omit empty fields.\n"
+            "- Make the output visually pleasant and easy to read.\n"
+            "If there are no events, say so in a friendly way.\n"
         )
+        print(f"[DEBUG] list_calendar_events: prompt={prompt}")
         try:
             response = fanar_client.chat.completions.create(
                 model="Fanar-C-1-8.7B",
@@ -249,7 +339,7 @@ def mcp_list_calendar_events(payload: ListCalendarEventsPayload):
         except Exception as e:
             print(f"[ERROR] Fanar LLM summarization failed: {e}")
             summary = None
-        return {"result": "Events found", "events": events, "summary": summary}
+        return {"result": "Events found", "events": filtered_events, "summary": summary}
     except Exception as e:
         import traceback
         print(f"[ERROR] list_calendar_events: {e}")

@@ -31,7 +31,7 @@ class MCPClient:
         if not self.main_server_url:
             raise ValueError("MCP_SERVER_URL not set in environment.")
         self.tools = {
-            "list_calendar_events": {"description": "Lists events from Google Calendar.", "payload": {"when": "str ('YYYY-MM-DD HH:MM')"}},
+            "list_calendar_events": {"description": "Lists events from Google Calendar.", "payload": {"start": "str (YYYY-MM-DD HH:MM)", "end": "str (YYYY-MM-DD HH:MM)", "max_results": "int (optional)"}},
             "create_calendar_event": {"description": "Creates an event in Google Calendar.", "payload": {"summary": "str", "start": "str (YYYY-MM-DD HH:MM)", "end": "str (YYYY-MM-DD HH:MM)"}},
             "arabic_email_agent": {"description": "Generates a professional Arabic email and sends it.", "payload": {"body": "str", "recipient_name": "str"}},
             "english_email_agent": {"description": "Generates a professional English email and sends it.", "payload": {"body": "str", "recipient_name": "str"}},
